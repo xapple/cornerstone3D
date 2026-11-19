@@ -101,11 +101,15 @@ export function postProcessDecodedPixels(
       maxBeforeScale,
       scalingParameters
     );
-    invalidType = !validatePixelDataType(
-      scaledValues.min,
-      scaledValues.max,
-      typedArrayConstructors[type]
-    );
+    // A factor that isn't whole can give whole values at both ends of the
+    // frame and fractions in between, so only a float array holds them.
+    invalidType = hasFloatRescale
+      ? typedArrayConstructors[type] !== Float32Array
+      : !validatePixelDataType(
+          scaledValues.min,
+          scaledValues.max,
+          typedArrayConstructors[type]
+        );
   }
 
   if (type && !invalidType) {
@@ -120,7 +124,8 @@ export function postProcessDecodedPixels(
       options,
       minBeforeScale,
       maxBeforeScale,
-      imageFrame
+      imageFrame,
+      hasFloatRescale
     );
   } else {
     pixelDataArray = _getDefaultPixelDataArray(
@@ -239,10 +244,21 @@ function _handlePreScaleSetup(
   options,
   minBeforeScale,
   maxBeforeScale,
-  imageFrame
+  imageFrame,
+  hasFloatRescale
 ) {
   const scalingParameters = options.preScale.scalingParameters;
   _validateScalingParameters(scalingParameters);
+
+  // The scaled extremes choose the array only for whole factors: with one
+  // that isn't (a rescale slope of 0.5, an SUV or a dose grid scaling), both
+  // ends can be whole and the values in between fractions, which an integer
+  // array would truncate.
+  if (hasFloatRescale) {
+    const typedArray = new Float32Array(imageFrame.pixelData.length);
+    typedArray.set(imageFrame.pixelData, 0);
+    return typedArray;
+  }
 
   const scaledValues = _calculateScaledMinMax(
     minBeforeScale,
@@ -266,38 +282,35 @@ function _getDefaultPixelDataArray(min, max, imageFrame) {
   return typedArray;
 }
 
+/**
+ * The lowest and highest values once scaled. A negative factor swaps the ends
+ * of the range, so the two are ordered.
+ */
 function _calculateScaledMinMax(minValue, maxValue, scalingParameters) {
   const { rescaleSlope, rescaleIntercept, modality, doseGridScaling, suvbw } =
     scalingParameters;
 
+  let scale = (value) => value;
+
   if (modality === 'PT' && typeof suvbw === 'number' && !isNaN(suvbw)) {
-    return {
-      min: suvbw * (minValue * rescaleSlope + rescaleIntercept),
-      max: suvbw * (maxValue * rescaleSlope + rescaleIntercept),
-    };
+    scale = (value) => suvbw * (value * rescaleSlope + rescaleIntercept);
   } else if (
     modality === 'RTDOSE' &&
     typeof doseGridScaling === 'number' &&
     !isNaN(doseGridScaling)
   ) {
-    return {
-      min: minValue * doseGridScaling,
-      max: maxValue * doseGridScaling,
-    };
+    scale = (value) => value * doseGridScaling;
   } else if (
     typeof rescaleSlope === 'number' &&
     typeof rescaleIntercept === 'number'
   ) {
-    return {
-      min: rescaleSlope * minValue + rescaleIntercept,
-      max: rescaleSlope * maxValue + rescaleIntercept,
-    };
-  } else {
-    return {
-      min: minValue,
-      max: maxValue,
-    };
+    scale = (value) => rescaleSlope * value + rescaleIntercept;
   }
+
+  const atMin = scale(minValue);
+  const atMax = scale(maxValue);
+
+  return { min: Math.min(atMin, atMax), max: Math.max(atMin, atMax) };
 }
 
 function _validateScalingParameters(scalingParameters) {
